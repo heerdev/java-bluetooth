@@ -16,14 +16,26 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.KeyManagerFactory;
-import java.io.BufferedReader;
+import javax.swing.BorderFactory;
+import javax.swing.JButton;
+import javax.swing.JFrame;
+import javax.swing.JLabel;
+import javax.swing.JPanel;
+import javax.swing.SwingConstants;
+import javax.swing.SwingUtilities;
+import java.awt.BorderLayout;
+import java.awt.Font;
+import java.awt.GridLayout;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyStore;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -55,10 +67,20 @@ public class TvRemote {
                     | FEATURE_VOLUME | FEATURE_APP_LINK;
 
     private static final CountDownLatch configured = new CountDownLatch(1);
+    private static final CountDownLatch disconnected = new CountDownLatch(1);
     private static final AtomicInteger activeFeatures = new AtomicInteger(0);
+    private static final ExecutorService commandExecutor =
+            Executors.newSingleThreadExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "tv-remote-commands");
+                thread.setDaemon(true);
+                return thread;
+            });
 
     private static volatile boolean connected;
     private static volatile OutputStream output;
+    private static volatile SSLSocket remoteSocket;
+    private static JLabel statusLabel;
+    private static JFrame window;
 
     private static final class Button {
         final String label;
@@ -83,71 +105,143 @@ public class TvRemote {
             new Button("MUTE / UNMUTE", 164)
     };
 
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> {
+            createWindow();
+            Thread connectionThread = new Thread(
+                    TvRemote::connectToTv, "tv-remote-connection");
+            connectionThread.setDaemon(true);
+            connectionThread.start();
+        });
+    }
+
+    private static void createWindow() {
+        window = new JFrame("Sharp TV Remote");
+        window.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
+        window.addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosing(WindowEvent event) {
+                quit();
+            }
+        });
+
+        JPanel content = new JPanel(new BorderLayout(12, 12));
+        content.setBorder(BorderFactory.createEmptyBorder(18, 18, 18, 18));
+
+        JLabel title = new JLabel("Sharp TV Remote", SwingConstants.CENTER);
+        title.setFont(title.getFont().deriveFont(Font.BOLD, 22f));
+        content.add(title, BorderLayout.NORTH);
+
+        JPanel controls = new JPanel(new GridLayout(0, 3, 8, 8));
+        controls.setBorder(BorderFactory.createEmptyBorder(16, 0, 12, 0));
+        addControl(controls, 0);
+        addControl(controls, 1);
+        addControl(controls, 2);
+        addControl(controls, 3);
+        addControl(controls, 4);
+        addControl(controls, 5);
+        addControl(controls, 6);
+        addControl(controls, 7);
+        addControl(controls, 8);
+        addControl(controls, 9);
+        content.add(controls, BorderLayout.CENTER);
+
+        JPanel footer = new JPanel(new BorderLayout(8, 8));
+        statusLabel = new JLabel("Starting TV remote...");
+        JButton quitButton = new JButton("0. Quit");
+        quitButton.addActionListener(event -> quit());
+        footer.add(statusLabel, BorderLayout.CENTER);
+        footer.add(quitButton, BorderLayout.EAST);
+        content.add(footer, BorderLayout.SOUTH);
+
+        window.setContentPane(content);
+        window.setSize(420, 470);
+        window.setLocationByPlatform(true);
+        window.setResizable(false);
+        window.setVisible(true);
+    }
+
+    private static void addControl(JPanel controls, int index) {
+        Button button = BUTTONS[index];
+        JButton control = new JButton((index + 1) + ". " + button.label);
+        control.addActionListener(event -> commandExecutor.execute(() -> {
+            try {
+                sendKey(button.keyCode);
+                setStatus("Sent " + button.label);
+            } catch (Exception e) {
+                setStatus("Could not send " + button.label + ": "
+                        + e.getMessage());
+            }
+        }));
+        controls.add(control);
+    }
+
+    private static void connectToTv() {
         if (CLIENT_PASSWORD.length == 0 || TRUST_PASSWORD.length == 0) {
-            System.err.println(
-                    "Set TV_CLIENT_PASSWORD and TV_TRUSTSTORE_PASSWORD " +
-                            "environment variables before running.");
-            System.err.println(
-                    "The trust store must be a PKCS12 store containing " +
-                            "the TV certificate.");
+            setStatus("Set TV_CLIENT_PASSWORD and TV_TRUSTSTORE_PASSWORD "
+                    + "to connect.");
             return;
         }
 
-        SSLContext sslContext = createSslContext();
+        try {
+            SSLContext sslContext = createSslContext();
+            try (SSLSocket socket =
+                         (SSLSocket) sslContext.getSocketFactory()
+                                 .createSocket(TV_HOST, TV_PORT)) {
+                remoteSocket = socket;
+                socket.setKeepAlive(true);
+                socket.startHandshake();
 
-        try (SSLSocket socket =
-                     (SSLSocket) sslContext.getSocketFactory()
-                             .createSocket(TV_HOST, TV_PORT)) {
+                InputStream input = socket.getInputStream();
+                output = socket.getOutputStream();
+                connected = true;
+                setStatus("TLS connected; waiting for TV configuration...");
 
-            socket.setKeepAlive(true);
-            socket.startHandshake();
+                Thread receiver = new Thread(
+                        () -> receiveMessages(input),
+                        "tv-remote-receiver");
+                receiver.setDaemon(true);
+                receiver.start();
 
-            System.out.println("TLS connected: " +
-                    socket.getSession().getProtocol());
+                if (!configured.await(10, TimeUnit.SECONDS)) {
+                    setStatus("Timed out waiting for TV configuration.");
+                    return;
+                }
 
-            InputStream input = socket.getInputStream();
-            output = socket.getOutputStream();
-            connected = true;
-
-            Thread receiver = new Thread(
-                    () -> receiveMessages(input),
-                    "tv-remote-receiver");
-            receiver.setDaemon(true);
-            receiver.start();
-
-            // Preserve the feature-negotiation approach that worked.
-           /* RemoteDeviceInfo deviceInfo = RemoteDeviceInfo.newBuilder()
-                    .setModel("Java TV Remote")
-                    .setVendor("Java")
-                    .setUnknown1(1)
-                    .setUnknown2("1")
-                    .setPackageName("atvremote")
-                    .setAppVersion("1.0.0")
-                    .build();
-
-            RemoteConfigure configure = RemoteConfigure.newBuilder()
-                    .setCode1(CLIENT_FEATURES)
-                    .setDeviceInfo(deviceInfo)
-                    .build();
-
-            send(RemoteMessage.newBuilder()
-                    .setRemoteConfigure(configure)
-                    .build());*/
-
-            System.out.println("Configuration sent.");
-
-            if (!configured.await(10, TimeUnit.SECONDS)) {
-                System.err.println(
-                        "Timed out waiting for the TV configuration response.");
-                return;
+                setStatus("Connected to Sharp TV.");
+                disconnected.await();
             }
-
-            runMenu();
-
+        } catch (Exception e) {
+            setStatus("Connection failed: " + e.getMessage());
+        } finally {
             connected = false;
-            System.out.println("Remote disconnected.");
+            output = null;
+            remoteSocket = null;
         }
+    }
+
+    private static void setStatus(String message) {
+        SwingUtilities.invokeLater(() -> {
+            if (statusLabel != null) {
+                statusLabel.setText(message);
+            }
+        });
+    }
+
+    private static void quit() {
+        connected = false;
+        commandExecutor.shutdownNow();
+        SSLSocket socket = remoteSocket;
+        if (socket != null) {
+            try {
+                socket.close();
+            } catch (Exception e) {
+                System.err.println("Could not close TV connection: "
+                        + e.getMessage());
+            }
+        }
+        disconnected.countDown();
+        window.dispose();
     }
 
     private static SSLContext createSslContext() throws Exception {
@@ -262,10 +356,11 @@ public class TvRemote {
             }
         } catch (Exception e) {
             if (connected) {
-                System.err.println(
-                        "TV receive loop ended: " + e.getMessage());
+                setStatus("TV connection ended: " + e.getMessage());
             }
         } finally {
+            connected = false;
+            disconnected.countDown();
             configured.countDown();
         }
     }
@@ -301,42 +396,4 @@ public class TvRemote {
         System.out.println("Sent: " + key.name());
     }
 
-    private static void runMenu() throws Exception {
-        try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(System.in))) {
-
-            while (connected) {
-                System.out.println();
-                System.out.println("=== Sharp TV Remote ===");
-
-                for (int i = 0; i < BUTTONS.length; i++) {
-                    System.out.printf("%2d. %s%n",
-                            i + 1, BUTTONS[i].label);
-                }
-
-                System.out.println(" 0. Quit");
-                System.out.print("Choose a button: ");
-
-                String line = reader.readLine();
-                if (line == null || line.trim().equals("0")) {
-                    break;
-                }
-
-                final int choice;
-                try {
-                    choice = Integer.parseInt(line.trim());
-                } catch (NumberFormatException e) {
-                    System.out.println("Enter a number from 0 to 10.");
-                    continue;
-                }
-
-                if (choice < 1 || choice > BUTTONS.length) {
-                    System.out.println("Enter a number from 0 to 10.");
-                    continue;
-                }
-
-                sendKey(BUTTONS[choice - 1].keyCode);
-            }
-        }
-    }
 }

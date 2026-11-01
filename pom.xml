@@ -67,7 +67,7 @@
                 <artifactId>exec-maven-plugin</artifactId>
                 <version>3.5.0</version>
                 <configuration>
-                    <mainClass>TvBluetoothScan</mainClass>
+                    <mainClass>com.example.tvremote.TvRemote</mainClass>
                 </configuration>
             </plugin>
         </plugins>
